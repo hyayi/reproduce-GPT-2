@@ -239,8 +239,4 @@ for i in range(num_return_sequences):
     tokens = x[i, :max_lenght].tolist()
     decoded = enc.decode(tokens)
     print(">", decoded)
-
-
-
-
-    
+    print("hello")
