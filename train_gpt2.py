@@ -28,10 +28,13 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C//self.n_head).transpose(1,2) # (B,nh, T, hs)
         v = v.view(B, T, self.n_head, C//self.n_head).transpose(1,2) # (B,nh, T, hs)
 
-        att = (q @ k.transpose(-2,-1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float("-inf"))
-        att = F.softmax(att,dim=-1)
-        y = att @ v #(B, nh, T, T) x (B, nb,T,hs) -> (B,nh,T,hs)
+        # att = (q @ k.transpose(-2,-1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float("-inf"))
+        # att = F.softmax(att,dim=-1)
+        # y = att @ v #(B, nh, T, T) x (B, nb,T,hs) -> (B,nh,T,hs)
+
+        y = F.scaled_dot_product_attention(q,k,v,is_causal=True)
+
         y = y.transpose(1,2).contiguous().view(B,T,C)
         y = self.c_proj(y)
         return y
@@ -218,27 +221,53 @@ if torch.cuda.is_available():
 
 train_loader = DataLoaderLite(B=16,T=1024)
 
-
+# torch.set_float32_matmul_precision('high')
 # get logits
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
+model = torch.compile(model)
+
+max_lr = 3e-4
+min_lr = max_lr * 0.1
+warmup_steps =10
+max_steps = 50
+
+def get_lr(it): # 카파시는  pytorch 스케줄러보다 구현해서 쓰는 것을 선호
+
+    if it < warmup_steps:
+        return max_lr * (it+1) / warmup_steps
+    if it > max_steps:
+        return min_lr
+
+    decay_ratio = (it - warmup_steps)/(max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr * coeff * (max_lr - min_lr)
+
+
 
 #optimizer
 import time
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9,0.95), eps=1e-8)
+for step in range(max_steps):
     t0 = time.time()
     x,y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x,y)
-    #import code; code.interact(local=locals())
+    with torch.autocast(device_type=device, dtype=torch.bfloat16) :
+        logits, loss = model(x,y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    #import code; code.interact(local=locals())
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0)*1000
-    print(f"step {i}, loss: {loss.item()}")
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {step}, loss: {loss.item()} | norm: {norm:.4f} | lr {lr:.4e}  | dt: {dt:.2f},s. tok/sec: {tokens_per_sec}")
 
 logits, loss = model(x,y)
 
