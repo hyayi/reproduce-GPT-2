@@ -4,6 +4,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import tiktoken
+import inspect
+import os
 # 작은 것에서 큰 것을 만드는 것이 아니라
 # 큰거에서 작은 것을 채워가자!
 #--------------------------------------------------------------------------------------
@@ -78,7 +80,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size :  int = 1024
-    vocab_size : int = 50257 # number of tokens: 50,000 BPE merges + 256 bytes token + 1 <|endoftext|> token
+    vocab_size : int = 50304 # number of tokens: 50,000 BPE merges + 256 bytes token + 1 <|endoftext|> token
     n_layer : int = 12
     n_head : int = 12
     n_embd: int = 768
@@ -102,7 +104,7 @@ class GPT(nn.Module):
         #weight sharing scheme # wte를 마지막 분류 레이어에서 재활용
         #이렇게해서 좋은 효과가 있다면 학습 시간을 줄일 수 있다
         #n_embed와 -> token의 임베딩의 가까워지게 끔 될 거 같긴해
-        self.transformer.wte.wegiht = self.lm_head.weight
+        self.transformer.wte.weight = self.lm_head.weight
 
         self.apply(self._init_weights)
     
@@ -180,11 +182,37 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         
         return model
+    
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+        decay_params = [p for n,p in param_dict.items() if p.dim() >=2]
+        nodecay_params = [p for n,p in param_dict.items() if p.dim() <2]
+
+        optim_groups =[
+            {"params":decay_params, "weight_decay" : weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0}
+        ]
+
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+
+        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and "cuda" in device
+        print(f"using fused Adamw:{use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
 #------------------------------------------------------------------------------
 class DataLoaderLite:
-    def __init__(self,B,T):
+    def __init__(self,B,T, process_rank, num_processes):
         self.B = B 
         self.T = T 
+        self.process_rank = process_rank
+        self.num_processes = num_processes
 
         with open("input.txt", "r") as f :
             text = f.read()
@@ -194,7 +222,7 @@ class DataLoaderLite:
         print(f"loaded {len(self.tokens)} tokens")
         print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
 
-        self.current_position=0
+        self.current_position=self.B * self.T * self.process_rank
     
     def next_batch(self):
         B, T = self.B, self.T
@@ -202,32 +230,69 @@ class DataLoaderLite:
         x = (buf[:-1]).view(B,T)
         y = (buf[1:]).view(B,T)
 
-        self.current_position += B * T 
-        if self.current_position + (B * T + 1) > len(self.tokens):
-            self.current_position = 0
+        self.current_position += B * T * self.num_processes
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
         return x, y
 
+#-----------------------------------------------------------------------------
+# run the training loop
+from torch.distributed import init_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device ="mps"
-print(f"using device : {device}")
+ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
+
+if ddp :
+    assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ["RANK"])
+    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    ddp_world_size = int(os.environ["WORLD_SIZE"])
+    device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device)
+    master_process = ddp_rank  == 0
+
+else :
+    ddp_rank = 0 
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process =True
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device ="mps"
+    print(f"using device : {device}")
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-train_loader = DataLoaderLite(B=16,T=1024)
+total_batch_size =524288
+B = 16
+T = 1024
+assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
+grad_accum_steps = total_batch_size // (B*T*ddp_world_size)
+if master_process :
+    print(f"total_desired batch size : {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+# print("I am GPU", ddp_rank)
+# print("Bye")
+# import sys; sys.exit(0)
+
+train_loader = DataLoaderLite(B=B,T=T,process_rank=ddp_rank,num_processes=ddp_world_size)
+
 
 # torch.set_float32_matmul_precision('high')
 # get logits
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 model = torch.compile(model)
+if ddp:
+    model = DDP(model, device_ids={ddp_local_rank})
 
-max_lr = 3e-4
+max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps =10
 max_steps = 50
@@ -248,15 +313,20 @@ def get_lr(it): # 카파시는  pytorch 스케줄러보다 구현해서 쓰는 �
 
 #optimizer
 import time
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9,0.95), eps=1e-8)
+#optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9,0.95), eps=1e-8)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 for step in range(max_steps):
     t0 = time.time()
-    x,y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16) :
-        logits, loss = model(x,y)
-    loss.backward()
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps) :
+        x,y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16) :
+            logits, loss = model(x,y)
+        loss = loss/grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
     lr = get_lr(step)
@@ -266,8 +336,9 @@ for step in range(max_steps):
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0)*1000
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {step}, loss: {loss.item()} | norm: {norm:.4f} | lr {lr:.4e}  | dt: {dt:.2f},s. tok/sec: {tokens_per_sec}")
+    tokens_precessed = train_loader.B * train_loader.T *grad_accum_steps
+    tokens_per_sec = tokens_precessed /dt
+    print(f"step {step}, loss: {loss_accum.item()} | norm: {norm:.4f} | lr {lr:.4e}  | dt: {dt:.2f},s. tok/sec: {tokens_per_sec}")
 
 logits, loss = model(x,y)
 
