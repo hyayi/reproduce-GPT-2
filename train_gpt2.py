@@ -326,6 +326,8 @@ for step in range(max_steps):
             logits, loss = model(x,y)
         loss = loss/grad_accum_steps
         loss_accum += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps -1)
         loss.backward()
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
