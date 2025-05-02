@@ -6,6 +6,8 @@ import math
 import tiktoken
 import inspect
 import os
+
+
 # 작은 것에서 큰 것을 만드는 것이 아니라
 # 큰거에서 작은 것을 채워가자!
 #--------------------------------------------------------------------------------------
@@ -237,8 +239,9 @@ class DataLoaderLite:
 
 #-----------------------------------------------------------------------------
 # run the training loop
-from torch.distributed import init_process_group
+from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 
@@ -290,8 +293,8 @@ model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 model = torch.compile(model)
 if ddp:
-    model = DDP(model, device_ids={ddp_local_rank})
-
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps =10
@@ -314,7 +317,7 @@ def get_lr(it): # 카파시는  pytorch 스케줄러보다 구현해서 쓰는 �
 #optimizer
 import time
 #optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9,0.95), eps=1e-8)
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 for step in range(max_steps):
     t0 = time.time()
     optimizer.zero_grad()
@@ -329,6 +332,8 @@ for step in range(max_steps):
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps -1)
         loss.backward()
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
     lr = get_lr(step)
@@ -338,15 +343,19 @@ for step in range(max_steps):
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0)*1000
-    tokens_precessed = train_loader.B * train_loader.T *grad_accum_steps
+    tokens_precessed = train_loader.B * train_loader.T *grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_precessed /dt
-    print(f"step {step}, loss: {loss_accum.item()} | norm: {norm:.4f} | lr {lr:.4e}  | dt: {dt:.2f},s. tok/sec: {tokens_per_sec}")
+    if master_process:
+        print(f"step {step}, loss: {loss_accum.item()} | norm: {norm:.4f} | lr {lr:.4e}  | dt: {dt:.2f},s. tok/sec: {tokens_per_sec}")
+
+if ddp:
+    destroy_process_group()
+
+import sys;sys.exit(0)
 
 logits, loss = model(x,y)
 
 print(loss)
-import sys;sys.exit(0)
-
 num_return_sequences = 5
 max_lenght = 30
 
